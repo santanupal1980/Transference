@@ -1,7 +1,7 @@
 import logging
 import sys
 from os import makedirs
-from os.path import exists as p_check
+from os.path import exists as path_check
 from random import seed as rpyseed
 from random import shuffle, sample
 
@@ -17,10 +17,12 @@ from lrsch import GoogleLR
 from modules import *
 
 
-def train(td, tl, ed, nd, optm, lrsch, model, lossf, mv_device, logger, done_tokens, multi_gpu, tokens_optm=32768,
+# train function required training data (td), validation data (ed)
+def train(train_data, tl, ed, nd, optm, lrsch, model, lossf, mv_device, logger, done_tokens, multi_gpu,
+          tokens_optm=32768,
           nreport=None, save_every=None, chkpf=None, chkpof=None, statesf=None, num_checkpoint=1, cur_checkid=0,
           report_eva=True, remain_steps=None, save_loss=False):
-    sum_loss = 0.0
+    sum_loss = 0.0  # total loss after itearing through the training data
     sum_wd = 0
     part_loss = 0.0
     part_wd = 0
@@ -33,14 +35,14 @@ def train(td, tl, ed, nd, optm, lrsch, model, lossf, mv_device, logger, done_tok
     _ls = {} if save_loss else None
 
     for i_d, m_d, t_d in tqdm(tl):
-        seq_batch = torch.from_numpy(td[i_d][:]).long()  # tensor for source
-        seq_batch_mt = torch.from_numpy(td[m_d][:]).long()  # tensor for mt
-        seq_o = torch.from_numpy(td[t_d][:]).long()  # tensor for pe
-        lo = seq_o.size(1) - 1  # ourput sequence length
+        seq_batch_src = torch.from_numpy(train_data[i_d][:]).long()  # tensor for source
+        seq_batch_mt = torch.from_numpy(train_data[m_d][:]).long()  # tensor for mt
+        seq_batch_pe = torch.from_numpy(train_data[t_d][:]).long()  # tensor for pe
+        lo = seq_batch_pe.size(1) - 1  # output sequence length
         if mv_device:  # moving tensors to GPU for fast processing
-            seq_batch = seq_batch.to(mv_device)
+            seq_batch_src = seq_batch_src.to(mv_device)
             seq_batch_mt = seq_batch_mt.to(mv_device)
-            seq_o = seq_o.to(mv_device)
+            seq_batch_pe = seq_batch_pe.to(mv_device)
 
         if _done_tokens >= tokens_optm:
             # token optimization condition lets say if 25000 tokens are initialized then after every 25000 token processed
@@ -48,17 +50,21 @@ def train(td, tl, ed, nd, optm, lrsch, model, lossf, mv_device, logger, done_tok
             optm.zero_grad()  # [Before training clear the gradient]
             _done_tokens = 0  # RESET
 
-        oi = seq_o.narrow(1, 0,
-                          lo)  # INPUT OF THE DECODER, LIKE LM TRAINING THE LAST TOKEN NEED TO GNERT SO WITHOUT LAST TOKEN NEED TO INPUT </S>
-        ot = seq_o.narrow(1, 1, lo).contiguous()  # WITHOUT FIRST TOKEN <S>
-        output = model(seq_batch, seq_batch_mt, oi)  # CALL MODEL
-        loss = lossf(output, ot)  # CALCULATE LOSS
+        # INPUT OF THE DECODER, LIKE LM TRAINING THE LAST TOKEN NEED TO GNERT SO WITHOUT LAST TOKEN NEED TO INPUT </S>
+        dec_seq_input = seq_batch_pe.narrow(1, 0, lo)
+        dec_seq_output = seq_batch_pe.narrow(1, 1, lo).contiguous()  # WITHOUT FIRST TOKEN <S>
+        output = model(seq_batch_src, seq_batch_mt, dec_seq_input)  # CALL MODEL
+        loss = lossf(output, dec_seq_output)  # CALCULATE LOSS
+
         if multi_gpu:
             loss = loss.sum()
+
         loss_add = loss.data.item()
         sum_loss += loss_add  # OVERALL LOSS
-        wd_add = ot.numel() - ot.eq(
-            0).sum().item()  # HOW MANY ELEMENT IN THE OUTPUT TOKENS HAVE BEEN PROCESSED[TODO: WHY?]
+
+        # HOW MANY ELEMENT IN THE OUTPUT TOKENS HAVE BEEN PROCESSED
+        wd_add = dec_seq_output.numel() - dec_seq_output.eq(0).sum().item()
+
         if save_loss:
             _ls[(i_d, m_d, t_d)] = loss_add / wd_add
         sum_wd += wd_add
@@ -76,7 +82,8 @@ def train(td, tl, ed, nd, optm, lrsch, model, lossf, mv_device, logger, done_tok
                 part_loss = 0.0
                 part_wd = 0
 
-        # scale the sum of losses down according to the number of tokens adviced by: https://mp.weixin.qq.com/s/qAHZ4L5qK3rongCIIq5hQw, I think not reasonable.
+        # scale the sum of losses down according to the number of tokens adviced by: https://mp.weixin.qq.com/s/qAHZ4L5qK3rongCIIq5hQw,
+        # I think not reasonable.
         # loss /= wd_add
         loss.backward()
 
@@ -140,7 +147,7 @@ def eva(ed, nd, model, lossf, mv_device, multi_gpu):
             else:
                 trans = torch.argmax(output, -1)
             sum_loss += loss.data.item()
-            data_mask = 1 - ot.eq(0)
+            data_mask = 1 - ot.eq(0)  # ?
             correct = torch.gt(trans.eq(ot) + data_mask, 1)
             w += data_mask.sum().item()
             r += correct.sum().item()
@@ -148,6 +155,7 @@ def eva(ed, nd, model, lossf, mv_device, multi_gpu):
     return sum_loss / w, (w - r) / w * 100.0
 
 
+# to know learing rates during optimization
 def getlr(optm):
     lr = []
     for i, param_group in enumerate(optm.param_groups):
@@ -155,6 +163,7 @@ def getlr(optm):
     return lr
 
 
+# this function returns boolean value indicating whether the learning rate is updated or not
 def updated_lr(oldlr, newlr):
     rs = False
     for olr, nlr in zip(oldlr, newlr):
@@ -164,6 +173,7 @@ def updated_lr(oldlr, newlr):
     return rs
 
 
+# TODO: need to be documented
 def hook_lr_update(optm, flags):
     for group in optm.param_groups:
         for p in group['params']:
@@ -176,6 +186,7 @@ def hook_lr_update(optm, flags):
                     state['max_exp_avg_sq'].zero_()
 
 
+# TODO: need to be documented
 def dynamic_sample(incd, dss_ws, dss_rm):
     rd = {}
     for k, v in incd.items():
@@ -212,12 +223,14 @@ def get_logger(fname):
     return logger
 
 
+# TODO: need to be documented
 def save_states(fname, stl):
     with open(fname, "wb") as f:
         f.write(" ".join([i[0][1:] for i in stl]).encode("utf-8"))
         f.write("\n".encode("utf-8"))
 
 
+# TODO: need to be documented
 def load_states(fname):
     rs = []
     with open(fname, "rb") as f:
@@ -230,6 +243,7 @@ def load_states(fname):
     return [("i" + tmpu, "m" + tmpu, "t" + tmpu) for tmpu in rs]
 
 
+# TODO: need to be documented
 def load_model_cpu(modf, base_model):
     mpg = torch.load(modf, map_location='cpu')
 
@@ -258,7 +272,7 @@ def main():
         rid = sys.argv[1]  # getting runid from console
 
     earlystop = cnfg.earlystop  # Get early-stop criteria
-    maxrun = cnfg.maxrun  #
+    epochs = cnfg.epochs  #
 
     tokens_optm = cnfg.tokens_optm  # number of tokens
 
@@ -270,23 +284,27 @@ def main():
     use_cuda = cnfg.use_cuda
     gpuid = cnfg.gpuid
 
+    # GPU configuration
     if use_cuda and torch.cuda.is_available():
         use_cuda = True
         if len(gpuid.split(",")) > 1:
             cuda_device = torch.device(gpuid[:gpuid.find(",")].strip())
             cuda_devices = [int(_.strip()) for _ in gpuid[gpuid.find(":") + 1:].split(",")]
+            print('[Info] using multiple gpu', cuda_devices)
             multi_gpu = True
         else:
             cuda_device = torch.device(gpuid)
             multi_gpu = False
+            print('[Info] using single gpu', cuda_device)
             cuda_devices = None
         torch.cuda.set_device(cuda_device.index)
     else:
         cuda_device = False
+        print('using single cpu')
         multi_gpu = False
         cuda_devices = None
 
-    use_ams = cnfg.use_ams
+    use_ams = cnfg.use_ams  # ?
 
     save_optm_state = cnfg.save_optm_state
 
@@ -296,8 +314,8 @@ def main():
 
     remain_steps = cnfg.training_steps
 
-    wkdir = "".join((cnfg.work_dir, cnfg.data_dir, "/", rid, "/"))
-    if not p_check(wkdir):
+    wkdir = "".join((cnfg.work_dir, cnfg.data_dir, "/", rid, "/"))  # CREATING MODEL DIRECTORY
+    if not path_check(wkdir):
         makedirs(wkdir)
 
     chkpt = None
@@ -311,15 +329,20 @@ def main():
 
     logger = get_logger(wkdir + "train.log")  # Logger object
 
-    train_data = h5py.File(cnfg.train_data, "r")
-    valid_data = h5py.File(cnfg.dev_data, "r")
+    train_data = h5py.File(cnfg.train_data, "r")  # training data read from h5 file
+    valid_data = h5py.File(cnfg.dev_data, "r")  # validation data read from h5 file
 
     print('[Info] Training and Validation data are loaded.')
 
-    ntrain = int(train_data["ndata"][:][0])  # TRAINING DATA SIZE
-    nvalid = int(valid_data["ndata"][:][0])
+    ntrain = int(train_data["ndata"][:][0])  # number of batches for TRAINING DATA
+    nvalid = int(valid_data["ndata"][:][0])  # number of batches for VALIDATION DATA
     nwordi = int(train_data["nwordi"][:][0])  # VOCAB SIZE FOR SOURCE
     nwordt = int(train_data["nwordt"][:][0])  # VOCAB SIZE FOR PE [TODO: SIMILAR FOR MT]
+
+    print('[INFO] number of batches for TRAINING DATA: ', ntrain)
+    print('[INFO] number of batches for VALIDATION DATA: ', nvalid)
+    print('[INFO] Source vocab size: ', nwordi)
+    print('[INFO] Target vocab size: ', nwordt)
 
     random_seed = torch.initial_seed() if cnfg.seed is None else cnfg.seed
 
@@ -393,7 +416,7 @@ def main():
         lossf = DataParallelCriterion(lossf, device_ids=cuda_devices, output_device=cuda_device.index,
                                       replicate_once=True)'''
 
-    # TODO: Need to implement to initialize fine tune state
+    # Load fine tune state if declared
     fine_tune_state = cnfg.fine_tune_state
     if fine_tune_state is not None:
         logger.info("Load optimizer state from: " + fine_tune_state)
@@ -414,13 +437,13 @@ def main():
     # if fine_tune_m is None:
     save_model(mymodel, wkdir + "init.t7", multi_gpu)
     logger.info("Initial model saved")
-
+    # ==================================================Fine tune ========================================
     if fine_tune_m is None:
         save_model(mymodel, wkdir + "init.t7", multi_gpu)
         logger.info("Initial model saved")
     else:
         cnt_states = cnfg.train_statesf
-        if (cnt_states is not None) and p_check(cnt_states):
+        if (cnt_states is not None) and path_check(cnt_states):
             logger.info("Continue last epoch")
             args = {}
             tminerr, done_tokens, cur_checkid, remain_steps, _ = train(train_data, load_states(cnt_states), valid_data,
@@ -441,7 +464,9 @@ def main():
 
         # assume that the continue trained model has already been through sort grad, thus shuffle the training list.
         shuffle(tl)
+    # ====================================================================================================
 
+    # ================================Dynamic sentence Sampling =========================================
     if cnfg.dss_ws is not None and cnfg.dss_ws > 0.0 and cnfg.dss_ws < 1.0:
         dss_ws = int(cnfg.dss_ws * ntrain)
         _Dws = {}
@@ -455,10 +480,12 @@ def main():
         dss_ws = 0
         dss_rm = 0
         _Dws = None
+    # ====================================================================================================
 
     namin = 0
 
-    for i in range(1, maxrun + 1):
+    # TRAINING EPOCH STARTS
+    for i in range(1, epochs + 1):
         terr, done_tokens, cur_checkid, remain_steps, _Dws = train(train_data, tl, valid_data, nvalid, optimizer, lrsch,
                                                                    mymodel, lossf,
                                                                    cuda_device, logger, done_tokens, multi_gpu,
@@ -468,14 +495,16 @@ def main():
                                                                    num_checkpoint, cur_checkid, report_eva,
                                                                    remain_steps,
                                                                    dss_ws > 0)
+        # VALIDATION
         vloss, vprec = eva(valid_data, nvalid, mymodel, lossf, cuda_device, multi_gpu)
-        logger.info("Epoch: %d, train loss: %.3f, valid loss/error: %.3f %.2f" % (i, terr, vloss, vprec))
+        logger.info("Epoch: %d ||| train loss: %.3f ||| valid loss/error: %.3f/%.2f" % (i, terr, vloss, vprec))
 
+        # CONDITION TO SAVE MODELS
         if (vprec <= minerr) or (vloss <= minloss):
             save_model(mymodel, wkdir + "eva_%d_%.3f_%.3f_%.2f.t7" % (i, terr, vloss, vprec), multi_gpu)
             if save_optm_state:
                 torch.save(optimizer.state_dict(), wkdir + "eva_%d_%.3f_%.3f_%.2f.optm.t7" % (i, terr, vloss, vprec))
-            logger.info("New best model saved")
+            logger.info("New best model saved")  # [TODO CALCULATE BLEU FOR VALIDATION SET]
 
             namin = 0
 
@@ -495,6 +524,7 @@ def main():
                 save_model(mymodel, wkdir + "epoch_%d_%.3f_%.3f_%.2f.t7" % (i, terr, vloss, vprec), multi_gpu)
 
             namin += 1
+            # CONDITIONED TO EARLY STOP
             if namin >= earlystop:
                 if done_tokens > 0:
                     if multi_gpu:
@@ -521,12 +551,12 @@ def main():
 
         shuffle(tl)
 
-    # oldlr = getlr(optimizer)
-    # lrsch.step(terr)
-    # newlr = getlr(optimizer)
-    # if updated_lr(oldlr, newlr):
-    # logger.info("".join(("lr update from: ", ",".join(tostr(oldlr)), ", to: ", ",".join(tostr(newlr)))))
-    # hook_lr_update(optimizer, use_ams)
+        '''oldlr = getlr(optimizer)
+        lrsch.step(terr)
+        newlr = getlr(optimizer)
+        if updated_lr(oldlr, newlr):
+          logger.info("".join(("lr update from: ", ",".join(tostr(oldlr)), ", to: ", ",".join(tostr(newlr)))))
+          hook_lr_update(optimizer, use_ams)'''
 
     if done_tokens > 0:
         if multi_gpu:
