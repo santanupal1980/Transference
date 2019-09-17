@@ -88,8 +88,8 @@ def main(sourcefile, mtfile, targetfile, threshold=0.2):
 if __name__ == '__main__':
     import sys
 
-    if len(sys.argv) not in range(3, 5):
-        usage_msg = err_msg('Usage: python3 %s srcfile trgfile (threshold)\n'
+    if len(sys.argv) not in range(4, 6):
+        usage_msg = err_msg('Usage: python3 %s srcfile mtfile trgfile (threshold)\n'
                             % sys.argv[0])
 
         example_msg = err_msg('Example: python3 %s ~/Europarl.de-en.de ~/Europarl.de-en.mt '
